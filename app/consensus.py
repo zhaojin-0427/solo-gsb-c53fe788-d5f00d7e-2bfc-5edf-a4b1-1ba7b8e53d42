@@ -17,6 +17,7 @@ Pipeline for one request payload:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter, OrderedDict, defaultdict
 from typing import Any, Dict, List, Tuple
@@ -60,9 +61,26 @@ def canonical_payload(req: ConsensusRequest) -> dict:
 
 
 def payload_hash(req: ConsensusRequest) -> str:
-    import hashlib
-
     blob = json.dumps(canonical_payload(req), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def read_content_hash(r: ReadIn) -> str:
+    """Stable fingerprint of one read's content (everything except read_id).
+
+    Used by the persistent read_id registry to detect the same read_id
+    reappearing with different content in a later request.
+    """
+    blob = json.dumps(
+        {
+            "locus": r.locus,
+            "umi": r.umi,
+            "sequence": r.sequence,
+            "qualities": list(r.qualities),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 

@@ -1,0 +1,9 @@
+{
+  "request_id": "demo-run-002",
+  "sample_id": "sample-2026-1002",
+  "reads": [
+    {"locus": "IGH-A", "read_id": "a01", "umi": "AAAAA", "sequence": "ACGG", "qualities": [40, 40, 40, 40]},
+    {"locus": "IGH-A", "read_id": "e01", "umi": "AAAAA", "sequence": "ACGT", "qualities": [40, 40, 40, 40]},
+    {"locus": "IGH-A", "read_id": "e02", "umi": "AAAAA", "sequence": "ACGT", "qualities": [40, 40, 40, 40]}
+  ]
+}

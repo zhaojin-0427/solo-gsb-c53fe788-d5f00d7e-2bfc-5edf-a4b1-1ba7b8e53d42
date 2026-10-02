@@ -5,7 +5,8 @@
 剔除 PCR/测序错误；对无法可靠判定的簇（多代表命中、低覆盖、低质量优势不足）整簇淘汰。
 
 - `POST /consensus`：提交一批 reads，创建一个**不可变**的版本化结果（同 `request_id`
-  同载荷幂等；载荷冲突或同 `read_id` 内容冲突返回 `409`）。
+  同载荷幂等；载荷冲突返回 `409`；同一 `read_id` 在**单次请求内或跨请求**携带不同
+  内容也返回 `409`）。
 - `GET /consensus/{version}`：按版本号读取创建时的**不可变快照**。
 - `GET /healthz`：健康检查。
 
@@ -51,14 +52,32 @@ N 位置的覆盖数、各碱基权重与是否平票）。
 - 同一请求内 `read_id` 相同但内容（locus/umi/sequence/qualities）不同 → **409**。
 - 完全相同的重复行允许提交，自动去重并计入 `stats.duplicate_read_rows`。
 
-### 1.4 不可变版本与读取一致性
+### 1.4 跨请求 read_id 内容登记（read registry）
+
+服务把每个被接受请求中的 `read_id` 内容指纹（`locus/umi/sequence/qualities` 的
+SHA-256）持久化在 `read_contents` 表中。之后任何请求复用同一 `read_id` 时，在
+**提交事务（`BEGIN IMMEDIATE`）内原子比对**：
+
+- 内容**相同** → 允许，正常创建新版本（跨请求复用同一 read 是合法的）；
+- 内容**不同** → **409**，不创建新版本、不改动任何已有快照；
+- 同一 `request_id` 的幂等重放优先于该检查：同载荷重放永远返回原版本。
+
+由于检查与写入在同一个持有写锁的事务中完成，并发提交同一 `read_id` 的两种不同
+内容时**只有一种能落库**，另一个必然收到 409。
+
+**旧库升级**：服务启动时自动迁移（`PRAGMA user_version`）。历史快照只存结果、不含
+原始 read 内容，因此迁移会把旧结果 `clusters[].read_ids` 中出现过的 `read_id` 登记为
+**内容未知**（`content_hash = NULL`，不伪造内容记录）；这些 `read_id` 之后一律拒绝复用
+（409，即使提交的内容恰好与当年一致也无法验证）。历史版本的读取完全不受影响。
+
+### 1.5 不可变版本与读取一致性
 
 - 版本号由 SQLite `AUTOINCREMENT` 单调分配，结果落盘后永不更新、删除；
 - `GET /consensus/{version}` 永远返回创建那一刻的快照；
 - 写入在单条 `BEGIN IMMEDIATE` 事务中完成（版本分配 + 两张表插入原子化），
   SQLite 配置 WAL 与 30s busy timeout，并发提交同样安全。
 
-### 1.5 请求校验（422）
+### 1.6 请求校验（422）
 
 - `sequence` / `umi` 只允许 `A/C/G/T`；
 - `qualities` 为 0～40 的整数，且与 `sequence` **等长**；
@@ -76,6 +95,7 @@ docker compose up --build
 ```
 
 服务监听 http://localhost:8000 ，SQLite 数据保存在命名卷 `umi-data`（容器内 `/data/umi.db`）。
+首次启动（或挂载旧版本数据目录）时会自动完成数据库结构迁移，无需手工干预。
 
 停止：
 
@@ -277,6 +297,42 @@ curl -sS -X POST http://localhost:8000/consensus \
 {"detail": {"error": "read_id content conflict", "conflicts": [{"read_id": "dup", "reason": "same read_id with different content"}]}}
 ```
 
+### 跨请求 read_id 内容冲突 → 409
+
+`read_id` 的内容登记是**持久**的：换一个 `request_id` 也无法让同名 read 携带不同
+内容落库。先提交上面的 `examples/request.json`（其中 `a01` 的 `sequence` 为 `ACGT`），
+再提交 [`examples/cross_request_conflict.json`](examples/cross_request_conflict.json)
+（新 `request_id` = `demo-run-002`，但 `a01` 的 `sequence` 改成了 `ACGG`）：
+
+```bash
+curl -sS -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' --data @examples/request.json
+# → 200, version 1
+
+curl -sS -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' --data @examples/cross_request_conflict.json
+```
+
+```json
+{
+  "detail": {
+    "error": "read_id content conflict",
+    "conflicts": [
+      {"read_id": "a01", "reason": "read_id already recorded with different content"}
+    ]
+  }
+}
+```
+
+冲突请求不会创建新版本（`GET /healthz` 中 `latest_version` 不变），`GET /consensus/1`
+快照也不受影响。反之，若新请求中的 `a01` 与已登记内容**完全一致**（例如把
+`cross_request_conflict.json` 中 `a01` 的 `sequence` 改回 `ACGT` 再提交），则允许
+复用并正常创建 `version 2`。
+
+> 旧库升级说明：升级前创建的版本里出现过的 `read_id` 会被登记为“内容未知”，
+> 之后复用这些 id 一律返回 409（reason 为 `... original content cannot be verified`），
+> 但旧版本的读取不受影响。
+
 ### 读取不可变版本
 
 ```bash
@@ -298,10 +354,12 @@ curl -i http://localhost:8000/consensus/999
 ├── app/
 │   ├── main.py          # FastAPI 路由、启动、错误处理
 │   ├── schemas.py       # Pydantic 请求/响应模型与校验
-│   ├── consensus.py     # 分簇、加权投票、载荷指纹（纯函数，可单测）
-│   └── db.py            # SQLite 存储、版本分配、幂等事务
-├── tests/               # pytest：算法单测 + API 端到端（30 个用例）
+│   ├── consensus.py     # 分簇、加权投票、载荷/read 内容指纹（纯函数，可单测）
+│   └── db.py            # SQLite 存储、版本分配、幂等事务、read_id 内容登记与旧库迁移
+├── tests/               # pytest：算法单测 + API 端到端 + 跨请求冲突/迁移（45 个用例）
 ├── examples/request.json
+├── examples/conflict.json
+├── examples/cross_request_conflict.json
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -2,27 +2,14 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from .consensus import find_readid_conflicts
-from .db import ConflictError, Database
-from .schemas import ConsensusRequest, ConsensusResult
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-from contextlib import asynccontextmanager
-
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
-
-from .consensus import find_readid_conflicts
-from .db import DEFAULT_DB_PATH, ConflictError, Database
+from .db import DEFAULT_DB_PATH, ConflictError, Database, ReadConflictError
 from .schemas import ConsensusRequest, ConsensusResult
 
 
@@ -45,7 +32,9 @@ app = FastAPI(
     description=(
         "Cluster reads by UMI (frequency/lexicographic ordering, Hamming "
         "distance <= 1 assignment, multi-hit clusters ambiguous) and build a "
-        "Phred-weighted per-position consensus. Versions are immutable."
+        "Phred-weighted per-position consensus. Versions are immutable. "
+        "Read ids are registered persistently: reusing a read_id with "
+        "different content in a later request is rejected with 409."
     ),
 )
 
@@ -93,6 +82,16 @@ def post_consensus(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": str(exc), "request_id": req.request_id},
+        )
+    except ReadConflictError as exc:
+        # A read_id was already persisted with different content (or its
+        # content is unverifiable legacy data) by an earlier request.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "read_id content conflict",
+                "conflicts": exc.conflicts,
+            },
         )
     response.headers["X-Idempotent-Replay"] = "true" if replayed else "false"
     response.headers["X-Version"] = str(result["version"])
