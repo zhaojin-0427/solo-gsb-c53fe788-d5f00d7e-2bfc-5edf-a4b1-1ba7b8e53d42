@@ -5,7 +5,8 @@
 剔除 PCR/测序错误；对无法可靠判定的簇（多代表命中、低覆盖、低质量优势不足）整簇淘汰。
 
 - `POST /consensus`：提交一批 reads，创建一个**不可变**的版本化结果（同 `request_id`
-  同载荷幂等；载荷冲突或同 `read_id` 内容冲突返回 `409`）。
+  同载荷幂等；载荷冲突返回 `409`；同一 `read_id` 在同请求或跨请求携带不同内容均
+  返回 `409`）。
 - `GET /consensus/{version}`：按版本号读取创建时的**不可变快照**。
 - `GET /healthz`：健康检查。
 
@@ -49,14 +50,35 @@ N 位置的覆盖数、各碱基权重与是否平票）。
   - 相同指纹 → 返回已存版本，HTTP 头 `X-Idempotent-Replay: true`（不会产生新版本）；
   - 不同指纹 → **409 Conflict**。
 - 同一请求内 `read_id` 相同但内容（locus/umi/sequence/qualities）不同 → **409**。
+- **跨请求的 `read_id` 是全局的**：服务在 `read_registry` 表中持久记录每个已提交
+  `read_id` 的规范内容（locus/umi/sequence/qualities 的 SHA-256 指纹，随首次接受的
+  版本在同一条 `BEGIN IMMEDIATE` 事务中写入）。
+  - 用**另一个 `request_id`** 提交同名 read，但 locus / umi / sequence / qualities
+    **任一不同** → **409 Conflict**；不会分配新版本，也不会改动任何旧快照或已记录的
+    read 内容。
+  - 不同 `request_id` 提交**内容完全相同**的同名 read → 允许，正常创建新版本。
+  - 并发的冲突提交由单条写事务串行化：**只有一种内容能落库**，其余请求收到 409。
 - 完全相同的重复行允许提交，自动去重并计入 `stats.duplicate_read_rows`。
+
+#### 旧版数据库升级
+
+升级到本版本时，若库中还没有 `read_registry` 表，服务会自动建表并扫描已有版本快照：
+
+- **旧版本照常可读**，`GET /consensus/{version}` 返回与升级前完全一致的快照；
+- 旧快照的 `clusters[].read_ids` 只保留了 read_id，**无法还原原始的
+  locus/umi/sequence/qualities**。这些 id 会以内容为 NULL 的「墓碑」记录登记：
+  后续**任何复用该 read_id 的提交都返回 409**（即使新内容看起来合理），服务绝不
+  伪造内容记录；
+- 使用全新 read_id 的提交不受影响，正常创建版本。
 
 ### 1.4 不可变版本与读取一致性
 
 - 版本号由 SQLite `AUTOINCREMENT` 单调分配，结果落盘后永不更新、删除；
 - `GET /consensus/{version}` 永远返回创建那一刻的快照；
-- 写入在单条 `BEGIN IMMEDIATE` 事务中完成（版本分配 + 两张表插入原子化），
-  SQLite 配置 WAL 与 30s busy timeout，并发提交同样安全。
+- 写入在单条 `BEGIN IMMEDIATE` 事务中完成（版本分配 + `requests`/`versions`/
+  `read_registry` 三表写入与跨请求 read 内容比对全部原子化），冲突时整体回滚：
+  不留空版本号、不登记任何 read；SQLite 配置 WAL 与 30s busy timeout，并发提交
+  同样安全。
 
 ### 1.5 请求校验（422）
 
@@ -75,7 +97,24 @@ N 位置的覆盖数、各碱基权重与是否平票）。
 docker compose up --build
 ```
 
-服务监听 http://localhost:8000 ，SQLite 数据保存在命名卷 `umi-data`（容器内 `/data/umi.db`）。
+启动后：
+
+- 服务地址：http://localhost:8000
+- Swagger UI：http://localhost:8000/docs ；OpenAPI：http://localhost:8000/openapi.json
+- 健康检查：http://localhost:8000/healthz
+- SQLite 数据保存在命名卷 `umi-data`（容器内 `/data/umi.db`）；升级镜像后旧库
+  会自动迁移（见 [1.3 旧版数据库升级](#13-幂等与冲突)），旧版本可继续读取。
+
+快速验证跨请求 `read_id` 冲突防护：
+
+```bash
+curl -sS -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' --data @examples/request.json          # 200 v1
+curl -sS -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' --data @examples/cross_request_reuse.json    # 200 v2
+curl -i  -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' --data @examples/cross_request_conflict.json # 409
+```
 
 停止：
 
@@ -273,9 +312,58 @@ curl -sS -X POST http://localhost:8000/consensus \
 
 ### 同 read_id 内容冲突 → 409
 
+同一请求内：
+
 ```json
 {"detail": {"error": "read_id content conflict", "conflicts": [{"read_id": "dup", "reason": "same read_id with different content"}]}}
 ```
+
+### 跨请求 read_id 内容冲突 → 409
+
+`read_id` 全局唯一地标识一条 read 的内容。先用 `examples/request.json`
+（`request_id=demo-run-001`，其中 `a02.sequence = ACGT`）提交后，再换一个
+`request_id` 提交**内容相同**的 read 是允许的（产生新版本）：
+
+```bash
+# examples/cross_request_reuse.json：request_id=demo-run-002，
+# 复用 a01..a04 且内容与首次提交完全一致
+curl -i -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' \
+  --data @examples/cross_request_reuse.json
+```
+
+```
+HTTP/1.1 200 OK
+x-idempotent-replay: false
+x-version: 2
+```
+
+但如果另一个请求里同名 read 的 locus / umi / sequence / qualities 任一不同
+（下例把 `a02` 的 `sequence` 从 `ACGT` 改成 `ACGG`）：
+
+```bash
+# examples/cross_request_conflict.json：request_id=demo-run-003，
+# read_id=a02 与 demo-run-001 中的内容不一致
+curl -i -X POST http://localhost:8000/consensus \
+  -H 'Content-Type: application/json' \
+  --data @examples/cross_request_conflict.json
+```
+
+```
+HTTP/1.1 409 Conflict
+```
+
+```json
+{"detail": {"error": "read_id='a02' was already submitted with different content (locus/umi/sequence/qualities)"}}
+```
+
+该请求整体回滚：不产生新版本（`/healthz` 的 `latest_version` 不变）、旧快照
+不变，请求里其余全新的 read_id 也不会被登记。把 `request_id` 换成与已存内容
+一致的载荷后可重新提交成功。
+
+> 升级旧库后，若某 `read_id` 只在旧版本快照中出现过、原始内容已无法还原，
+> 复用它会得到：
+> `{"detail": {"error": "read_id='...' appeared in a pre-upgrade result whose original content cannot be recovered; the read_id cannot be reused"}}`。
 
 ### 读取不可变版本
 
@@ -298,10 +386,13 @@ curl -i http://localhost:8000/consensus/999
 ├── app/
 │   ├── main.py          # FastAPI 路由、启动、错误处理
 │   ├── schemas.py       # Pydantic 请求/响应模型与校验
-│   ├── consensus.py     # 分簇、加权投票、载荷指纹（纯函数，可单测）
-│   └── db.py            # SQLite 存储、版本分配、幂等事务
-├── tests/               # pytest：算法单测 + API 端到端（30 个用例）
+│   ├── consensus.py     # 分簇、加权投票、载荷/read 内容指纹（纯函数，可单测）
+│   └── db.py            # SQLite 存储、版本分配、幂等与跨请求 read 冲突事务、旧库迁移
+├── tests/               # pytest：算法单测 + API 端到端（39 个用例）
 ├── examples/request.json
+├── examples/conflict.json                 # 同 request_id 异载荷
+├── examples/cross_request_reuse.json      # 跨请求同内容复用 → 新版本
+├── examples/cross_request_conflict.json   # 跨请求同名 read 异内容 → 409
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

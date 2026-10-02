@@ -66,6 +66,22 @@ def payload_hash(req: ConsensusRequest) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def read_content_hash(r: ReadIn) -> str:
+    """Stable fingerprint of one read's content (everything but read_id).
+
+    Two rows sharing a ``read_id`` are considered the same read only when
+    locus, umi, sequence and qualities are byte-for-byte identical.
+    """
+    import hashlib
+
+    blob = json.dumps(
+        [r.locus, r.umi, r.sequence, list(r.qualities)],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def find_readid_conflicts(req: ConsensusRequest) -> List[dict]:
     """Return rows describing same read_id carrying different content."""
     seen: Dict[str, Tuple[str, str, str, Tuple[int, ...]]] = {}
